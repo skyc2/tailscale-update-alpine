@@ -215,7 +215,14 @@ script_path() {
 	local p
 	case $0 in
 	*/*) p=$0 ;;
-	*) p=$(command -v -- "$0" 2>/dev/null) || return 1 ;;
+	*)
+		# "sh tailscale-update.sh" reads the script from the current directory.
+		if [ -f "$0" ]; then
+			p=./$0
+		else
+			p=$(command -v -- "$0" 2>/dev/null) || return 1
+		fi
+		;;
 	esac
 	[ -f "$p" ] && grep -q "^PROG=$PROG\$" "$p" 2>/dev/null || return 1
 	printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd)" "$(basename "$p")"
@@ -772,35 +779,59 @@ on_exit() {
 	exit "$rc"
 }
 
-# as_state_owner CODE ARG: run shell CODE with ARG as $1 and the privileges of
-# the state directory's owner. tailscaled may run as an unprivileged user who
-# can plant links in that directory; this way they can't redirect root's reads
-# and writes there.
-as_state_owner() {
-	local owner
-	owner=$(stat -c %U "$TS_STATEDIR" 2>/dev/null) || return 1
-	if [ "$owner" != root ]; then
-		su -s /bin/sh -c "$1" "$owner" sh "$2"
-	elif [ -n "$(find "$TS_STATEDIR" -maxdepth 0 \( -perm -020 -o -perm -002 \))" ]; then
-		log "$TS_STATEDIR is writable by other users"
-		return 1
-	else
-		sh -c "$1" sh "$2"
+# tailscaled may run as an unprivileged user (command_user) who owns the state
+# directory and could plant links there to redirect root's reads and writes.
+# While tailscaled is stopped, the state is copied with the directory made
+# root-only, so that nobody else can change its entries meanwhile. The original
+# owner and mode are kept in a file until they are put back, so an interrupted
+# run can restore them.
+lock_statedir() {
+	if [ ! -f "$STATE_DIR/statedir.perms" ]; then
+		stat -L -c '%u:%g %a' "$TS_STATEDIR" >"$STATE_DIR/statedir.perms" || return 1
 	fi
+	chown root:root "$TS_STATEDIR" && chmod 700 "$TS_STATEDIR"
 }
 
+unlock_statedir() {
+	local owner mode
+	[ -f "$STATE_DIR/statedir.perms" ] || return 0
+	read -r owner mode <"$STATE_DIR/statedir.perms"
+	chown "$owner" "$TS_STATEDIR" && chmod "$mode" "$TS_STATEDIR" &&
+		rm -f "$STATE_DIR/statedir.perms"
+}
+
+# Save the state of the stopped tailscaled for rollback_to. Without a backup a
+# rollback keeps the current state.
 backup_state() {
-	rm -f "$BACKUP_DIR/tailscaled.state"
-	[ -f "$TS_STATEDIR/tailscaled.state" ] || return 0
-	mkdir -p "$BACKUP_DIR" || return 1
-	# shellcheck disable=SC2016 # expanded by as_state_owner
-	(umask 077 && as_state_owner 'cat "$1"' "$TS_STATEDIR/tailscaled.state" >"$BACKUP_DIR/tailscaled.state")
+	local f="$TS_STATEDIR/tailscaled.state" result=0
+	rm -f "$BACKUP_DIR/tailscaled.state" "$BACKUP_DIR/tailscaled.state.perms"
+	[ -e "$f" ] || [ -L "$f" ] || return 0
+	mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR" && lock_statedir || result=1
+	if [ "$result" = 0 ]; then
+		if [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %h "$f")" = 1 ]; then
+			stat -c '%u:%g %a' "$f" >"$BACKUP_DIR/tailscaled.state.perms" &&
+				(umask 077 && cp "$f" "$BACKUP_DIR/tailscaled.state") || result=1
+		else
+			log "$f is not a regular file"
+			result=1
+		fi
+	fi
+	unlock_statedir || result=1
+	if [ "$result" != 0 ]; then
+		rm -f "$BACKUP_DIR/tailscaled.state" "$BACKUP_DIR/tailscaled.state.perms"
+		warn "not backing up $f; a rollback will keep its current state"
+	fi
+	return 0
 }
 
 restore_state() {
-	# shellcheck disable=SC2016 # expanded by as_state_owner
-	as_state_owner 'umask 077 && cat >"$1.tmp" && rm -f "$1" && mv "$1.tmp" "$1"' \
-		"$TS_STATEDIR/tailscaled.state" <"$BACKUP_DIR/tailscaled.state"
+	local f="$TS_STATEDIR/tailscaled.state" perms result=0
+	read -r perms <"$BACKUP_DIR/tailscaled.state.perms" || return 1
+	lock_statedir || return 1
+	rm -f "$f" && (umask 077 && cp "$BACKUP_DIR/tailscaled.state" "$f") &&
+		chown "${perms% *}" "$f" && chmod "${perms#* }" "$f" || result=1
+	unlock_statedir || result=1
+	return "$result"
 }
 
 # set_pending FROM TO START WANT: remember an update in progress, so that an
@@ -901,7 +932,7 @@ activate() {
 rollback_to() {
 	log "Rolling back to $1"
 	activate "$1" "$2" "$3" && return 0
-	[ "$2" = 1 ] && [ -f "$BACKUP_DIR/tailscaled.state" ] || return 1
+	[ "$2" = 1 ] && [ -f "$BACKUP_DIR/tailscaled.state.perms" ] || return 1
 	log "Restoring the tailscaled state saved before the update"
 	svc_stop
 	restore_state || return 1
@@ -992,12 +1023,12 @@ cmd_update() {
 	fi
 	probe_service
 	[ -n "$old" ] || START=1 # fresh install
-	backup_state || die "could not back up $TS_STATEDIR/tailscaled.state"
 
 	log "Switching to Tailscale $latest; tailscale connections will drop for a few seconds"
 	defer_signals
 	set_pending "$old" "$latest" "$START" "$WANT"
 	svc_stop
+	backup_state
 	if [ -n "$apk_pkgs" ]; then
 		log "Removing Alpine packages: $apk_pkgs"
 		# shellcheck disable=SC2086
@@ -1044,11 +1075,12 @@ cmd_rollback() {
 	[ -n "$prev" ] && [ "$prev" != "$cur" ] || die "no previous version recorded"
 	[ -d "$INSTALL_DIR/$prev" ] || die "$INSTALL_DIR/$prev no longer exists"
 	probe_service
-	backup_state || die "could not back up $TS_STATEDIR/tailscaled.state"
 
 	log "Rolling back from $cur to $prev"
 	defer_signals
 	set_pending "$cur" "$prev" "$START" "$WANT"
+	svc_stop
+	backup_state
 	if rollback_to "$prev" "$START" "$WANT"; then
 		state_set good "$prev"
 		state_set previous "$cur"
@@ -1113,6 +1145,7 @@ run_worker() {
 	leave_service_cgroup
 	acquire_lock
 	load_service_config
+	unlock_statedir
 	recover_pending
 	case $1 in
 	update) cmd_update ;;
