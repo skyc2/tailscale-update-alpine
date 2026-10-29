@@ -35,7 +35,9 @@ fi
 # Settings; override them in $CONFIG_FILE.
 : "${TRACK:=stable}"                      # stable or unstable
 : "${PKGS_URL:=https://pkgs.tailscale.com}"
-: "${VERIFY_SIGNATURE:=yes}"              # yes (installs openssl if needed), auto or no
+# Release signature check: yes (installs openssl if needed), auto (only if
+# openssl 3 is installed) or no (rely on HTTPS and SHA-256 only).
+: "${VERIFY_SIGNATURE:=yes}"
 : "${SERVICE:=tailscale}"                 # OpenRC service name
 : "${INSTALL_DIR:=/opt/tailscale}"        # one sub-directory per installed version
 : "${BIN_DIR:=/usr/local/bin}"
@@ -44,7 +46,7 @@ fi
 : "${LOG_FILE:=/var/log/tailscale-update.log}"
 : "${HEALTH_TIMEOUT:=120}"                # seconds to wait for tailscaled to come up
 : "${KEEP_VERSIONS:=3}"                   # versions kept in $INSTALL_DIR for rollback
-: "${CRON_SCHEDULE:=17 4 * * *}"
+: "${CRON_SCHEDULE:=17 4 * * *}"         # when the daily check runs (crontab syntax)
 : "${CRON_MAX_DELAY:=3600}"               # random delay (seconds) before a cron run
 : "${COMPAT_LINKS:=yes}"                  # link /usr/sbin/tailscaled and /usr/bin/tailscale
 
@@ -54,6 +56,7 @@ SELF_PATH=$SBIN_DIR/$PROG
 BACKUP_DIR=$STATE_DIR/backup
 LOCK_DIR=$STATE_DIR/lock
 MARKER="Managed by $PROG"
+CRON_TAG="# $PROG"
 APK_PACKAGES="tailscale tailscale-openrc tailscale-doc tailscale-bash-completion
 	tailscale-fish-completion tailscale-zsh-completion tailscale-systemd"
 # Files of Alpine's tailscale-openrc package that are kept when it is removed.
@@ -70,6 +73,8 @@ TS_SOCKET=/run/tailscale/tailscaled.sock
 TS_STATEDIR=/var/lib/tailscale
 DS_STATE=
 DS_VERSION=
+START=0
+WANT=
 STAGING=
 LOCKED=0
 
@@ -93,6 +98,8 @@ die() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "$PROG must be run as root"; }
 
 usage() {
 	cat <<EOF
@@ -262,10 +269,24 @@ daemon_status() {
 	[ -n "$DS_STATE" ]
 }
 
-# wait_healthy VERSION WANT_STATE: wait for tailscaled VERSION to be up and,
+# Note how tailscale runs now, to get back to the same after a switch: sets
+# START (1 if the service is up) and WANT (Running if it is connected).
+probe_service() {
+	START=0
+	WANT=
+	svc_running || return 0
+	START=1
+	if daemon_status && [ "$DS_STATE" = Running ]; then
+		WANT=Running
+	fi
+	return 0
+}
+
+# wait_healthy ID WANT_STATE: wait for tailscaled of version ID to be up and,
 # if WANT_STATE is set, in that backend state.
 wait_healthy() {
-	local ver="$1" want="$2" waited=0
+	local ver want="$2" waited=0
+	ver=$(ver_of "$1")
 	while :; do
 		DS_STATE=
 		DS_VERSION=
@@ -319,7 +340,14 @@ find_unmanaged() {
 
 bin_version() { "$1" --version 2>/dev/null | head -n 1; }
 
-# Print the installed Alpine tailscale packages.
+# import_id TAILSCALED SUFFIX: print the id to keep TAILSCALED under.
+import_id() {
+	local v
+	v=$(bin_version "$1")
+	valid_version "$v" || die "cannot tell the version of $1 ('$v')"
+	printf '%s-%s\n' "$v" "$2"
+}
+
 apk_installed() {
 	local p out=''
 	for p in $APK_PACKAGES; do
@@ -636,36 +664,16 @@ EOF
 
 write_default_confd() {
 	cat >"$CONFD" <<'EOF'
-# Configuration for /etc/init.d/tailscale
-
-# UDP port to listen on for WireGuard and peer-to-peer traffic. 0 means
-# automatically select.
-#port=41641
-
-# Firewall mode: nftables (default here), iptables or auto.
-#firewall_mode="nftables"
-
-# Don't send logs to Tailscale Inc. This also disables any technical support
-# from Tailscale Inc.
-#no_logs_no_support=no
-
-# Log verbosity level; 0 is default, 1 or higher are increasingly verbose.
-#verbose=0
-
-# File to redirect output into. Set to an empty string to disable.
-#logfile="/var/log/tailscaled.log"
-
-# Path of the service unix socket, in its own directory.
-#socket="/run/tailscale/tailscaled.sock"
-
-# Directory for state, TLS certs, incoming Taildrop files, etc.
-#statedir="/var/lib/tailscale"
-
-# Additional options to pass to tailscaled.
-#command_args=
-
-# User and group to run tailscaled as.
-#command_user="root"
+# Settings for /etc/init.d/tailscale; uncomment to change the defaults.
+#port=41641                        # UDP port for WireGuard, 0 picks one
+#firewall_mode=nftables            # nftables, iptables or auto
+#no_logs_no_support=no             # yes: send no logs (and get no support)
+#verbose=0                         # tailscaled log verbosity
+#logfile=/var/log/tailscaled.log   # empty: no log file
+#socket=/run/tailscale/tailscaled.sock
+#statedir=/var/lib/tailscale
+#command_args=                     # extra tailscaled options
+#command_user=root
 EOF
 }
 
@@ -775,6 +783,8 @@ set_pending() {
 	state_set pending "${1:--} ${2:--} ${3:-0} ${4:--}"
 }
 
+clear_pending() { rm -f "$STATE_DIR/pending"; }
+
 install_self() {
 	local src
 	if ! src=$(script_path); then
@@ -791,27 +801,37 @@ install_self() {
 cron_line() {
 	local opts=''
 	[ "$TRACK" = stable ] || opts=" --track $TRACK"
-	printf '%s %s --cron%s >/dev/null 2>&1 # %s\n' "$CRON_SCHEDULE" "$SELF_PATH" "$opts" "$PROG"
+	printf '%s %s --cron%s >/dev/null 2>&1 %s\n' "$CRON_SCHEDULE" "$SELF_PATH" "$opts" "$CRON_TAG"
+}
+
+our_cron_line() { crontab -l 2>/dev/null | grep "$CRON_TAG\$"; }
+
+other_cron_lines() { crontab -l 2>/dev/null | grep -v "$CRON_TAG\$"; }
+
+# Replace root's crontab with stdin.
+write_crontab() {
+	local tmp result
+	tmp=$(mktemp) || return 1
+	cat >"$tmp"
+	crontab "$tmp"
+	result=$?
+	rm -f "$tmp"
+	return "$result"
 }
 
 install_cron() {
-	local tab line tmp
+	local line
 	have crontab || {
 		warn "crontab not found; daily update checks are not set up"
 		return 1
 	}
 	install_self || return 1
 	line=$(cron_line)
-	tab=$(crontab -l 2>/dev/null)
-	if ! printf '%s\n' "$tab" | grep -qxF "$line"; then
-		tmp=$(mktemp) || return 1
-		printf '%s\n' "$tab" | grep -v "# $PROG\$" | sed '/./,$!d' >"$tmp"
-		printf '%s\n' "$line" >>"$tmp"
-		crontab "$tmp" || {
-			rm -f "$tmp"
-			return 1
-		}
-		rm -f "$tmp"
+	if [ "$(our_cron_line)" != "$line" ]; then
+		{
+			other_cron_lines | sed '/./,$!d'
+			printf '%s\n' "$line"
+		} | write_crontab || return 1
 		log "Installed cron job: $line"
 	fi
 	if [ -e /etc/init.d/crond ]; then
@@ -823,13 +843,8 @@ install_cron() {
 }
 
 remove_cron() {
-	local tab tmp
-	tab=$(crontab -l 2>/dev/null) || return 0
-	printf '%s\n' "$tab" | grep -q "# $PROG\$" || return 0
-	tmp=$(mktemp) || return 1
-	printf '%s\n' "$tab" | grep -v "# $PROG\$" >"$tmp"
-	crontab "$tmp"
-	rm -f "$tmp"
+	[ -n "$(our_cron_line)" ] || return 0
+	other_cron_lines | write_crontab || return 1
 	log "Removed the $PROG cron job"
 }
 
@@ -841,14 +856,19 @@ defer_signals() {
 	trap 'warn "interrupt ignored while switching versions"' INT TERM
 }
 
+# start_healthy ID WANT: start tailscaled and wait until version ID is healthy.
+start_healthy() {
+	svc_start || warn "$SERVICE failed to start"
+	wait_healthy "$1" "$2"
+}
+
 # activate ID START WANT: switch to version ID; when START is 1, start
 # tailscaled and wait for it to become healthy.
 activate() {
 	svc_stop
 	link_version "$1" || return 1
 	[ "$2" = 1 ] || return 0
-	svc_start || warn "$SERVICE failed to start"
-	wait_healthy "$(ver_of "$1")" "$3"
+	start_healthy "$1" "$3"
 }
 
 # rollback_to ID START WANT
@@ -859,8 +879,7 @@ rollback_to() {
 	log "Restoring the tailscaled state saved before the update"
 	svc_stop
 	cp -p "$BACKUP_DIR/tailscaled.state" "$TS_STATEDIR/tailscaled.state" || return 1
-	svc_start || warn "$SERVICE failed to start"
-	wait_healthy "$(ver_of "$1")" "$3"
+	start_healthy "$1" "$3"
 }
 
 # Finish or roll back an update that was interrupted (e.g. by a reboot).
@@ -871,7 +890,7 @@ recover_pending() {
 	[ "$from" = - ] && from=
 	[ "$want" = - ] && want=
 	warn "an earlier update from ${from:-nothing} to $to did not finish"
-	if [ "$(current_id)" = "$to" ] && { [ "$start" != 1 ] || wait_healthy "$(ver_of "$to")" "$want"; }; then
+	if [ "$(current_id)" = "$to" ] && { [ "$start" != 1 ] || wait_healthy "$to" "$want"; }; then
 		log "$to is working; keeping it"
 		[ -n "$from" ] && state_set previous "$from"
 		state_set good "$to"
@@ -880,11 +899,11 @@ recover_pending() {
 		rollback_to "$from" "$start" "$want" || warn "$from is not healthy either"
 		mark_failed "$(ver_of "$to")"
 	fi
-	rm -f "$STATE_DIR/pending"
+	clear_pending
 }
 
 check_requirements() {
-	[ "$(id -u)" -eq 0 ] || die "$PROG must be run as root"
+	need_root
 	have apk || die "apk not found; this script is for Alpine Linux"
 	have rc-service && [ -x /sbin/openrc-run ] || die "OpenRC is required"
 	for c in tar sha256sum awk sed readlink mktemp; do
@@ -901,7 +920,7 @@ check_requirements() {
 # --- Commands ----------------------------------------------------------------
 
 cmd_update() {
-	local latest cur='' old='' import='' apk_pkgs cmp start=0 want='' fresh=0 v
+	local latest old='' import='' apk_pkgs cmp v result=0
 
 	if [ "$NO_CRON" != 1 ]; then
 		install_cron || warn "could not set up the daily cron job"
@@ -910,20 +929,13 @@ cmd_update() {
 	apk_pkgs=$(apk_installed)
 	if [ -n "$apk_pkgs" ] && [ -x /usr/sbin/tailscaled ] && [ ! -L /usr/sbin/tailscaled ]; then
 		import=/usr/sbin/tailscaled
-		v=$(bin_version "$import")
-		valid_version "$v" || die "cannot tell the version of $import ('$v')"
-		old=$v-apk
-	elif cur=$(current_id); then
-		old=$cur
-		v=$(ver_of "$cur")
+		old=$(import_id "$import" apk) || exit 1
+	elif old=$(current_id); then
+		:
 	elif import=$(find_unmanaged); then
-		v=$(bin_version "$import")
-		valid_version "$v" || die "cannot tell the version of $import ('$v')"
-		old=$v-local
-	else
-		v=
-		fresh=1
+		old=$(import_id "$import" local) || exit 1
 	fi
+	v=$(ver_of "$old")
 	log "Installed: ${old:-none}${apk_pkgs:+ (Alpine packages: $apk_pkgs)}; latest $TRACK: $latest"
 
 	if [ -n "$v" ]; then
@@ -952,86 +964,77 @@ cmd_update() {
 	if [ -n "$apk_pkgs" ]; then
 		prepare_apk_removal "$apk_pkgs" || die "cannot remove the Alpine tailscale packages"
 	fi
-	if svc_running; then
-		start=1
-		daemon_status && [ "$DS_STATE" = Running ] && want=Running
-	elif [ "$fresh" = 1 ]; then
-		start=1
-	fi
+	probe_service
+	[ -n "$old" ] || START=1 # fresh install
 	backup_state || die "could not back up $TS_STATEDIR/tailscaled.state"
 
 	log "Switching to Tailscale $latest; tailscale connections will drop for a few seconds"
 	defer_signals
-	set_pending "$old" "$latest" "$start" "$want"
+	set_pending "$old" "$latest" "$START" "$WANT"
 	svc_stop
 	if [ -n "$apk_pkgs" ]; then
 		log "Removing Alpine packages: $apk_pkgs"
 		# shellcheck disable=SC2086
 		if ! apk del -q $apk_pkgs; then
-			rm -f "$STATE_DIR/pending"
-			[ "$start" = 1 ] && rc-service "$SERVICE" start
+			clear_pending
+			[ "$START" = 1 ] && rc-service "$SERVICE" start
 			die "apk del failed; the Alpine package was left in place"
 		fi
 	fi
 	install_service_files || warn "could not install all service files"
-	if [ "$fresh" = 1 ] || ! ls /etc/runlevels/*/"$SERVICE" >/dev/null 2>&1; then
+	if [ -z "$old" ] || ! ls /etc/runlevels/*/"$SERVICE" >/dev/null 2>&1; then
 		rc-update add "$SERVICE" default >/dev/null && log "Enabled $SERVICE at boot"
 	fi
 
-	if activate "$latest" "$start" "$want"; then
+	if activate "$latest" "$START" "$WANT"; then
 		[ -n "$old" ] && state_set previous "$old"
 		state_set good "$latest"
 		clear_failed "$latest"
-		rm -f "$STATE_DIR/pending"
-		trap 'exit 130' INT TERM
-		prune_versions
-		log "Tailscale is now at $latest"
-		[ "$start" = 1 ] || log "$SERVICE was not running and has not been started"
-		return 0
-	fi
-
-	if [ -z "$old" ]; then
-		rm -f "$STATE_DIR/pending"
-		die "Tailscale $latest did not come up and there is no older version to roll back to"
-	fi
-	if rollback_to "$old" "$start" "$want"; then
+	elif [ -z "$old" ]; then
+		log "ERROR: Tailscale $latest did not come up and there is no older version to roll back to"
+		result=1
+	elif rollback_to "$old" "$START" "$WANT"; then
 		mark_failed "$latest"
 		log "Rolled back to $old; $latest will be skipped until a newer release is out"
+		result=1
 	else
 		warn "$old is not healthy either; it was left in place (is the network up?)"
+		result=1
 	fi
-	rm -f "$STATE_DIR/pending"
-	exit 1
+	clear_pending
+	trap 'exit 130' INT TERM
+	[ "$result" = 0 ] || exit 1
+
+	prune_versions
+	log "Tailscale is now at $latest"
+	[ "$START" = 1 ] || log "$SERVICE was not running and has not been started"
 }
 
 cmd_rollback() {
-	local cur prev start=0 want=''
+	local cur prev result=0
 	[ -z "$(apk_installed)" ] || die "the Alpine tailscale package is installed; run '$PROG update' first"
 	cur=$(current_id) || die "tailscale is not managed by $PROG yet"
 	prev=$(state_get previous)
 	[ -n "$prev" ] && [ "$prev" != "$cur" ] || die "no previous version recorded"
 	[ -d "$INSTALL_DIR/$prev" ] || die "$INSTALL_DIR/$prev no longer exists"
-	if svc_running; then
-		start=1
-		daemon_status && [ "$DS_STATE" = Running ] && want=Running
-	fi
+	probe_service
 	backup_state || die "could not back up $TS_STATEDIR/tailscaled.state"
 
 	log "Rolling back from $cur to $prev"
 	defer_signals
-	set_pending "$cur" "$prev" "$start" "$want"
-	if rollback_to "$prev" "$start" "$want"; then
+	set_pending "$cur" "$prev" "$START" "$WANT"
+	if rollback_to "$prev" "$START" "$WANT"; then
 		state_set good "$prev"
 		state_set previous "$cur"
 		mark_failed "$(ver_of "$cur")"
-		rm -f "$STATE_DIR/pending"
-		log "Now at $prev; $(ver_of "$cur") will be skipped until a newer release is out"
-		return 0
+	else
+		warn "$prev did not come up; going back to $cur"
+		rollback_to "$cur" "$START" "$WANT" || warn "$cur is not healthy either"
+		result=1
 	fi
-	warn "$prev did not come up; going back to $cur"
-	rollback_to "$cur" "$start" "$want" || warn "$cur is not healthy either"
-	rm -f "$STATE_DIR/pending"
-	exit 1
+	clear_pending
+	[ "$result" = 0 ] || exit 1
+	log "Now at $prev; $(ver_of "$cur") will be skipped until a newer release is out"
 }
 
 cmd_status() {
@@ -1057,7 +1060,7 @@ cmd_status() {
 		echo "Latest $TRACK:   unknown (could not reach $PKGS_URL)"
 	fi
 	echo "Skipped:         $(tr '\n' ' ' <"$STATE_DIR/failed" 2>/dev/null)"
-	line=$(crontab -l 2>/dev/null | grep "# $PROG\$")
+	line=$(our_cron_line)
 	echo "Cron job:        ${line:-not installed}"
 	echo "Log:             $LOG_FILE"
 }
@@ -1096,7 +1099,7 @@ run_worker() {
 # update completes even when tailscaled carries this SSH connection.
 run_detached() {
 	local self result size tail_pid pid rc=1 waited=0
-	[ "$(id -u)" -eq 0 ] || die "$PROG must be run as root"
+	need_root
 	mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" || die "cannot create $STATE_DIR"
 	trim_log
 	: >>"$LOG_FILE"
@@ -1188,11 +1191,11 @@ print-init-script)
 	render_init_script
 	;;
 install-cron)
-	[ "$(id -u)" -eq 0 ] || die "$PROG must be run as root"
+	need_root
 	install_cron || exit 1
 	;;
 remove-cron)
-	[ "$(id -u)" -eq 0 ] || die "$PROG must be run as root"
+	need_root
 	remove_cron
 	;;
 update | rollback)

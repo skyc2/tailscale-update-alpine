@@ -1,5 +1,8 @@
 # tailscale-update-alpine
 
+[![CI](https://github.com/skyc2/tailscale-update-alpine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/skyc2/tailscale-update-alpine/actions/workflows/ci.yml?query=branch%3Amain)
+[![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fskyc2%2Ftailscale-update-alpine%2Fbadges%2Ftests.json)](https://github.com/skyc2/tailscale-update-alpine/actions/workflows/ci.yml?query=branch%3Amain)
+
 Keep [Tailscale](https://tailscale.com) on Alpine Linux at the latest official
 release.
 
@@ -71,32 +74,16 @@ tail -n 30 /var/log/tailscale-update.log
 Pressing Ctrl-C only stops following the log; the update keeps running in the
 background. Use `--foreground` to run it attached to the terminal instead.
 
-## Commands
+## Usage
 
-```
-tailscale-update [options] [command]
+`tailscale-update --help` lists all commands and options. The common ones:
 
-Commands:
-  update        Install the latest release, migrating from the Alpine
-                packages on first use (default)
-  rollback      Switch back to the previous known-good version and skip the
-                current one until a newer release is out
-  status        Show installed, known-good and latest versions
-  install-cron  Install this script as /usr/local/sbin/tailscale-update and run
-                it daily
-  remove-cron   Remove the daily cron job
-  print-init-script
-                Print the OpenRC script that is installed as
-                /etc/init.d/tailscale
-
-Options:
-  -f, --force        Retry a version that failed before, or downgrade
-  -t, --track NAME   Release track: stable (default) or unstable
-      --no-cron      Do not install the daily cron job
-      --foreground   Do not detach from the terminal
-      --cron         Run as the cron job (random delay, log to file only)
-  -V, --version      Print the version of this script
-  -h, --help         Show this help
+```sh
+tailscale-update              # update now (the default command)
+tailscale-update status       # installed, known-good and latest versions
+tailscale-update rollback     # go back to the previous known-good version
+tailscale-update --force      # retry a release that was rolled back before
+tailscale-update --track unstable
 ```
 
 ## Rollback
@@ -142,7 +129,8 @@ before anything is unpacked:
   root keys built into the `tailscale` client (see
   [distsign](https://github.com/tailscale/tailscale/tree/main/clientupdate/distsign)).
   The script ships the same root keys and checks the chain with `openssl`
-  (installed automatically if it's missing), just like `tailscale update` does.
+  (installed automatically if it's missing, see `VERIFY_SIGNATURE`), just like
+  `tailscale update` does.
 - **SHA-256**: the published `.sha256` checksum.
 
 As a final check, the new `tailscaled` must run on this machine and report the
@@ -150,25 +138,15 @@ expected version.
 
 ## Configuration
 
-Settings can be overridden in `/etc/tailscale-update.conf`, which is a shell
-file:
+Settings can be overridden in `/etc/tailscale-update.conf`, a shell file that
+is sourced before the defaults are applied. The settings block at the top of
+`tailscale-update.sh` lists every setting with its default and a short
+description. For example:
 
 ```sh
-# Release track: stable or unstable.
-TRACK=stable
-# Seconds to wait for tailscaled to become healthy after an upgrade.
-HEALTH_TIMEOUT=120
-# Versions kept in /opt/tailscale for rollback.
-KEEP_VERSIONS=3
-# When the daily check runs (crontab syntax), and the maximum random delay in
-# seconds added to spread out load on pkgs.tailscale.com.
-CRON_SCHEDULE="17 4 * * *"
-CRON_MAX_DELAY=3600
-# Signature check: yes (default, installs openssl if needed), auto (only if
-# openssl 3 is installed) or no (rely on HTTPS and SHA-256 only).
-VERIFY_SIGNATURE=yes
-# Set to no to skip the /usr/sbin/tailscaled and /usr/bin/tailscale links.
-COMPAT_LINKS=yes
+TRACK=unstable          # follow the unstable track
+HEALTH_TIMEOUT=300      # wait longer for slow links before rolling back
+CRON_SCHEDULE="5 3 * * *"
 ```
 
 `tailscaled` itself is still configured in `/etc/conf.d/tailscale`, which uses
@@ -218,7 +196,9 @@ generated OpenRC script. It also runs the integration tests on several Alpine
 releases. The tests mock apk, OpenRC, `tailscaled` and pkgs.tailscale.com
 (including release signatures), and cover the migration, upgrades, automatic
 and manual rollback, interrupted updates and losing the terminal mid-update.
-They change system files, so only run them in a throwaway container:
+The test count badge adds up the checks that passed across all the Alpine
+configurations in the latest CI run on `main`. The tests change system files,
+so only run them in a throwaway container:
 
 ```sh
 shellcheck --shell=sh tailscale-update.sh tests/integration.sh
