@@ -25,11 +25,16 @@ that:
 
 ## Quick start
 
+As root:
+
 ```sh
 wget https://raw.githubusercontent.com/skyc2/tailscale-update-alpine/main/tailscale-update.sh
 less tailscale-update.sh   # read it before running anything as root
-doas sh tailscale-update.sh
+sh tailscale-update.sh
 ```
+
+From a regular account, run the last command with `doas` or `sudo` if one of
+them is installed (neither is by default on Alpine).
 
 On first run the script:
 
@@ -169,7 +174,7 @@ the same settings as Alpine's `tailscale-openrc` package (`port`,
 ## Requirements
 
 - Alpine Linux with OpenRC
-- root, through `doas`, `sudo` or a root shell
+- root: a root shell, or `doas` or `sudo` if installed
 - `wget` (busybox, with `ssl_client`) or `curl`
 - an architecture with an official build: x86_64, aarch64, armv7/armhf, x86
   or riscv64
