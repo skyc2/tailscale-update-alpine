@@ -582,6 +582,29 @@ test_detached() {
 	check "exits 0" eq $? 0
 	check "daemon runs 2.1.0" eq "$(daemon_version)" 2.1.0
 	check "terminal shows the log" grep -q "Tailscale is now at 2.1.0" "$FAKE/out"
+
+	section "a piped update keeps its lock after losing its terminal"
+	release 2.2.0 stuck
+	setsid sh -c "sh -s update <$SCRIPT >$FAKE/out 2>&1" &
+	i=0
+	while [ $i -lt 50 ] && [ ! -s /var/lib/tailscale-update/lock/pid ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	# The worker is a subshell with the same command line; it ignores HUP.
+	pkill -HUP -f "sh -s update" 2>/dev/null
+	sleep 0.5
+	check "the lock names a live process" kill -0 "$(cat /var/lib/tailscale-update/lock/pid 2>/dev/null)"
+	sh "$SCRIPT" update --foreground >>"$FAKE/out" 2>&1
+	check "a second run is refused while the first is busy" eq $? 1
+	check "it reports the running update" log_has "another tailscale-update is running"
+	i=0
+	while [ $i -lt 100 ] && [ -d /var/lib/tailscale-update/lock ]; do
+		sleep 0.2
+		i=$((i + 1))
+	done
+	check "worker finished" test ! -d /var/lib/tailscale-update/lock
+	check "daemon runs 2.1.0 after the rollback" eq "$(daemon_version)" 2.1.0
 }
 
 test_fresh_install() {

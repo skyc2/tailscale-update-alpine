@@ -77,6 +77,7 @@ START=0
 WANT=
 STAGING=
 LOCKED=0
+WORKER_PID=$$
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -757,7 +758,7 @@ acquire_lock() {
 		rm -rf "$LOCK_DIR"
 		mkdir "$LOCK_DIR" || die "cannot create $LOCK_DIR"
 	fi
-	echo "$$" >"$LOCK_DIR/pid"
+	echo "$WORKER_PID" >"$LOCK_DIR/pid"
 	LOCKED=1
 }
 
@@ -1071,7 +1072,7 @@ leave_service_cgroup() {
 	local f
 	grep -q "$SERVICE" /proc/self/cgroup 2>/dev/null || return 0
 	for f in /sys/fs/cgroup/cgroup.procs /sys/fs/cgroup/*/cgroup.procs; do
-		{ printf '%s\n' "$$" >"$f"; } 2>/dev/null || :
+		{ printf '%s\n' "$WORKER_PID" >"$f"; } 2>/dev/null || :
 	done
 }
 
@@ -1080,7 +1081,7 @@ run_worker() {
 	trap 'exit 130' INT TERM
 	trap : HUP
 	if [ -n "${TSU_RESULT:-}" ]; then
-		echo "$$" >"$TSU_RESULT.pid"
+		echo "$WORKER_PID" >"$TSU_RESULT.pid"
 	fi
 	log "=== $PROG $PROG_VERSION: $1 ==="
 	check_requirements
@@ -1114,6 +1115,8 @@ run_detached() {
 	else
 		(
 			trap : HUP
+			# $$ is still the parent's PID in a subshell.
+			read -r WORKER_PID _ </proc/self/stat || WORKER_PID=$$
 			TSU_RESULT=$result
 			run_worker "$CMD"
 		) </dev/null >>"$LOG_FILE" 2>&1 &
