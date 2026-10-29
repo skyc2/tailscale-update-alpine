@@ -787,7 +787,7 @@ on_exit() {
 # run can restore them.
 lock_statedir() {
 	if [ ! -f "$STATE_DIR/statedir.perms" ]; then
-		stat -c '%u:%g %a' "$TS_STATEDIR" >"$STATE_DIR/statedir.perms" || return 1
+		stat -L -c '%u:%g %a' "$TS_STATEDIR" >"$STATE_DIR/statedir.perms" || return 1
 	fi
 	chown root:root "$TS_STATEDIR" && chmod 700 "$TS_STATEDIR"
 }

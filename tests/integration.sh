@@ -565,15 +565,18 @@ test_detached() {
 	release 1.99.0 good
 	: >"$FAKE/out"
 	# Run in a new session, like an SSH login, and hang it up as soon as the
-	# update starts, like a dropped connection.
+	# update starts, like a dropped connection: every process in the login
+	# session gets SIGHUP.
 	setsid sh -c "sh $SCRIPT update >$FAKE/out 2>&1" &
-	local i=0
-	while [ $i -lt 50 ] && [ ! -d /var/lib/tailscale-update/lock ]; do
+	local session=$! i=0
+	while [ $i -lt 300 ] && [ ! -d /var/lib/tailscale-update/lock ]; do
 		sleep 0.1
 		i=$((i + 1))
 	done
-	pkill -HUP -f "sh $SCRIPT update" 2>/dev/null
-	pkill -KILL -f "sh -c sh $SCRIPT update" 2>/dev/null
+	check "update started" test -d /var/lib/tailscale-update/lock
+	kill -HUP -- "-$session" 2>/dev/null
+	sleep 0.5
+	kill -KILL -- "-$session" 2>/dev/null
 	i=0
 	while [ $i -lt 100 ] && [ -d /var/lib/tailscale-update/lock ]; do
 		sleep 0.2
@@ -674,6 +677,17 @@ test_state_owned_by_service_user() {
 	check "backup does not contain root's file" sh -c \
 		'! grep -qs secret /var/lib/tailscale-update/backup/tailscaled.state'
 	rm -f /var/lib/tailscale/tailscaled.state
+
+	section "a symlinked state directory keeps its owner and mode"
+	mv /var/lib/tailscale /var/lib/tailscale.real
+	ln -s /var/lib/tailscale.real /var/lib/tailscale
+	echo state >/var/lib/tailscale.real/tailscaled.state
+	release 2.5.0 good
+	update update --foreground
+	check "update exits 0" eq $? 0
+	check "state was backed up" test -s /var/lib/tailscale-update/backup/tailscaled.state
+	check "the real directory keeps its owner and mode" eq \
+		"$(stat -c '%U:%G %a' /var/lib/tailscale.real)" "tailscale:tailscale 750"
 }
 
 test_cli() {
