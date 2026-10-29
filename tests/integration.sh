@@ -341,8 +341,14 @@ install_apk_tailscale() {
 	printf '/var/log/tailscaled.log {\n\tmissingok\n}\n' >/etc/logrotate.d/tailscale
 	printf 'tailscale\ntailscale-openrc\ntailscale-doc\nopenresolv\n' >"$APKDB/installed"
 	printf 'tailscale\n' >"$APKDB/world"
-	mkdir -p /var/lib/tailscale
+	# The layout the package creates: tailscaled runs as root:tailscale in a
+	# directory owned by the tailscale user.
+	addgroup -S tailscale 2>/dev/null
+	adduser -S -D -H -h /var/lib/tailscale -s /sbin/nologin -G tailscale tailscale 2>/dev/null
+	install -d -m 750 -o tailscale -g tailscale /var/lib/tailscale
 	echo "state-$1" >/var/lib/tailscale/tailscaled.state
+	chown root:tailscale /var/lib/tailscale/tailscaled.state
+	chmod 600 /var/lib/tailscale/tailscaled.state
 	rc-update add tailscale default
 	rc-service tailscale start
 	sleep 1.5
@@ -394,8 +400,14 @@ test_migration() {
 	section "migrate from the Alpine package to the official build"
 	install_apk_tailscale 1.80.0
 	release 1.90.0 good
-	update update --foreground
+	# Run it by its bare file name, as in "sh tailscale-update.sh".
+	(cd /root && sh tailscale-update.sh update --foreground) >>"$FAKE/out" 2>&1
 	check "update exits 0" eq $? 0
+	check "state was backed up" test -s /var/lib/tailscale-update/backup/tailscaled.state
+	check "state directory keeps its owner and mode" eq \
+		"$(stat -c '%U:%G %a' /var/lib/tailscale)" "tailscale:tailscale 750"
+	check "state file keeps its owner and mode" eq \
+		"$(stat -c '%U:%G %a' /var/lib/tailscale/tailscaled.state)" "root:tailscale 600"
 	check "daemon runs 1.90.0" eq "$(daemon_version)" 1.90.0
 	check "daemon is running" daemon_running
 	check "links point to 1.90.0" linked_to 1.90.0
@@ -626,10 +638,10 @@ test_fresh_install() {
 
 test_state_owned_by_service_user() {
 	section "the state backup cannot be abused by the service user"
-	adduser -S -D -H tailscale 2>/dev/null
-	chown -R tailscale /var/lib/tailscale
-	chmod 600 /var/lib/tailscale/tailscaled.state
+	chown tailscale:tailscale /var/lib/tailscale
 	echo state-before >/var/lib/tailscale/tailscaled.state
+	chown tailscale:tailscale /var/lib/tailscale/tailscaled.state
+	chmod 600 /var/lib/tailscale/tailscaled.state
 	echo canary >/root/canary
 	# The new and the old version both fail, so the saved state is restored,
 	# after the service user has replaced the state file with a link to a
@@ -642,24 +654,25 @@ test_state_owned_by_service_user() {
 	check "root's file is not overwritten" eq "$(cat /root/canary)" canary
 	check "state is a regular file again" test ! -L /var/lib/tailscale/tailscaled.state
 	check "state has the saved content" eq "$(cat /var/lib/tailscale/tailscaled.state)" state-before
-	check "state is owned by the service user" sh -c \
-		'find /var/lib/tailscale/tailscaled.state -user tailscale -perm 600 | grep -q .'
-	check "backup is root-only" sh -c \
-		'find /var/lib/tailscale-update/backup/tailscaled.state -user 0 -perm 600 | grep -q .'
+	check "state keeps its owner and mode" eq \
+		"$(stat -c '%U:%G %a' /var/lib/tailscale/tailscaled.state)" "tailscale:tailscale 600"
+	check "state directory keeps its owner and mode" eq \
+		"$(stat -c '%U:%G %a' /var/lib/tailscale)" "tailscale:tailscale 750"
+	check "backup is root-only" eq \
+		"$(stat -c '%U %a' /var/lib/tailscale-update/backup/tailscaled.state)" "root 600"
 	rm -f "$RUN/force-stuck" "$RUN/plant-link"
 
 	section "the state backup cannot be used to read root's files"
 	echo secret >/root/secret
 	chmod 600 /root/secret
 	ln -sfn /root/secret /var/lib/tailscale/tailscaled.state
-	rc-service tailscale restart
-	local pid
-	pid=$(daemon_pid)
+	release 2.4.0 good
 	update update --foreground
-	check "update exits 1" eq $? 1
-	check "daemon was not restarted" eq "$(daemon_pid)" "$pid"
+	check "update exits 0" eq $? 0
+	check "daemon runs 2.4.0" eq "$(daemon_version)" 2.4.0
+	check "reports that the state was not backed up" log_has "not backing up"
 	check "backup does not contain root's file" sh -c \
-		'! grep -q secret /var/lib/tailscale-update/backup/tailscaled.state 2>/dev/null'
+		'! grep -qs secret /var/lib/tailscale-update/backup/tailscaled.state'
 	rm -f /var/lib/tailscale/tailscaled.state
 }
 
