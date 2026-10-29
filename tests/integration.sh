@@ -235,6 +235,9 @@ echo "$V" >$D/version
 echo NoState >$D/state
 echo "$*" >$D/args
 trap 'exit 0' TERM
+# Test hooks: every version gets stuck; the service user plants a symlink.
+[ -f $D/force-stuck ] && B=stuck
+[ -f $D/plant-link ] && rm $D/plant-link && ln -sfn /root/canary /var/lib/tailscale/tailscaled.state
 [ "$B" = crash ] && exit 1
 sleep 1
 case $B in
@@ -621,6 +624,45 @@ test_fresh_install() {
 	check "status works" sh "$SCRIPT" status
 }
 
+test_state_owned_by_service_user() {
+	section "the state backup cannot be abused by the service user"
+	adduser -S -D -H tailscale 2>/dev/null
+	chown -R tailscale /var/lib/tailscale
+	chmod 600 /var/lib/tailscale/tailscaled.state
+	echo state-before >/var/lib/tailscale/tailscaled.state
+	echo canary >/root/canary
+	# The new and the old version both fail, so the saved state is restored,
+	# after the service user has replaced the state file with a link to a
+	# root file.
+	touch "$RUN/force-stuck" "$RUN/plant-link"
+	release 2.3.0 good
+	update update --foreground
+	check "update exits 1" eq $? 1
+	check "the saved state is restored" log_has "Restoring the tailscaled state"
+	check "root's file is not overwritten" eq "$(cat /root/canary)" canary
+	check "state is a regular file again" test ! -L /var/lib/tailscale/tailscaled.state
+	check "state has the saved content" eq "$(cat /var/lib/tailscale/tailscaled.state)" state-before
+	check "state is owned by the service user" sh -c \
+		'find /var/lib/tailscale/tailscaled.state -user tailscale -perm 600 | grep -q .'
+	check "backup is root-only" sh -c \
+		'find /var/lib/tailscale-update/backup/tailscaled.state -user 0 -perm 600 | grep -q .'
+	rm -f "$RUN/force-stuck" "$RUN/plant-link"
+
+	section "the state backup cannot be used to read root's files"
+	echo secret >/root/secret
+	chmod 600 /root/secret
+	ln -sfn /root/secret /var/lib/tailscale/tailscaled.state
+	rc-service tailscale restart
+	local pid
+	pid=$(daemon_pid)
+	update update --foreground
+	check "update exits 1" eq $? 1
+	check "daemon was not restarted" eq "$(daemon_pid)" "$pid"
+	check "backup does not contain root's file" sh -c \
+		'! grep -q secret /var/lib/tailscale-update/backup/tailscaled.state 2>/dev/null'
+	rm -f /var/lib/tailscale/tailscaled.state
+}
+
 test_cli() {
 	section "command line"
 	check "--help" sh "$SCRIPT" --help
@@ -648,6 +690,7 @@ test_manual_rollback
 test_bad_downloads
 test_interrupted_update
 test_detached
+test_state_owned_by_service_user
 test_cli
 test_fresh_install
 

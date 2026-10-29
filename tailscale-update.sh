@@ -772,10 +772,35 @@ on_exit() {
 	exit "$rc"
 }
 
+# as_state_owner CODE ARG: run shell CODE with ARG as $1 and the privileges of
+# the state directory's owner. tailscaled may run as an unprivileged user who
+# can plant links in that directory; this way they can't redirect root's reads
+# and writes there.
+as_state_owner() {
+	local owner
+	owner=$(stat -c %U "$TS_STATEDIR" 2>/dev/null) || return 1
+	if [ "$owner" != root ]; then
+		su -s /bin/sh -c "$1" "$owner" sh "$2"
+	elif [ -n "$(find "$TS_STATEDIR" -maxdepth 0 \( -perm -020 -o -perm -002 \))" ]; then
+		log "$TS_STATEDIR is writable by other users"
+		return 1
+	else
+		sh -c "$1" sh "$2"
+	fi
+}
+
 backup_state() {
 	rm -f "$BACKUP_DIR/tailscaled.state"
 	[ -f "$TS_STATEDIR/tailscaled.state" ] || return 0
-	mkdir -p "$BACKUP_DIR" && cp -p "$TS_STATEDIR/tailscaled.state" "$BACKUP_DIR/tailscaled.state"
+	mkdir -p "$BACKUP_DIR" || return 1
+	# shellcheck disable=SC2016 # expanded by as_state_owner
+	(umask 077 && as_state_owner 'cat "$1"' "$TS_STATEDIR/tailscaled.state" >"$BACKUP_DIR/tailscaled.state")
+}
+
+restore_state() {
+	# shellcheck disable=SC2016 # expanded by as_state_owner
+	as_state_owner 'umask 077 && cat >"$1.tmp" && rm -f "$1" && mv "$1.tmp" "$1"' \
+		"$TS_STATEDIR/tailscaled.state" <"$BACKUP_DIR/tailscaled.state"
 }
 
 # set_pending FROM TO START WANT: remember an update in progress, so that an
@@ -879,7 +904,7 @@ rollback_to() {
 	[ "$2" = 1 ] && [ -f "$BACKUP_DIR/tailscaled.state" ] || return 1
 	log "Restoring the tailscaled state saved before the update"
 	svc_stop
-	cp -p "$BACKUP_DIR/tailscaled.state" "$TS_STATEDIR/tailscaled.state" || return 1
+	restore_state || return 1
 	start_healthy "$1" "$3"
 }
 
