@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SHELLCHECK_VERSION: v0.11.0
+  SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ShellCheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/$SHELLCHECK_VERSION/shellcheck-$SHELLCHECK_VERSION.linux.x86_64.tar.xz"
+          echo "$SHELLCHECK_SHA256  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          sudo install -m 0755 "shellcheck-$SHELLCHECK_VERSION/shellcheck" /usr/local/bin/shellcheck
+          rm -rf shellcheck.tar.xz "shellcheck-$SHELLCHECK_VERSION"
+          shellcheck --version
+
+      - name: ShellCheck the scripts
+        run: shellcheck --shell=sh --severity=style tailscale-update.sh tests/integration.sh
+
+      - name: ShellCheck the generated OpenRC script
+        run: sh tailscale-update.sh print-init-script | shellcheck --shell=sh --severity=style -
+
+      - name: Check syntax with busybox ash
+        run: docker run --rm -v "$PWD:/src:ro" alpine:latest sh -n /src/tailscale-update.sh
+
+  test:
+    name: test (alpine ${{ matrix.alpine }}${{ !matrix.openssl && ', no openssl' || '' }})
+    runs-on: ubuntu-latest
+    needs: shellcheck
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - alpine: "3.21"
+            openssl: true
+          - alpine: latest
+            openssl: true
+          - alpine: latest
+            openssl: false
+          - alpine: edge
+            openssl: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run the integration tests
+        run: |
+          setup=true
+          if [ "${{ matrix.openssl }}" = true ]; then setup="apk add -q openssl"; fi
+          timeout 600 docker run --rm -v "$PWD:/src:ro" "alpine:${{ matrix.alpine }}" \
+            sh -c "$setup && sh /src/tests/integration.sh"
