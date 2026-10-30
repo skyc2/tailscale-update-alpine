@@ -97,6 +97,11 @@ while [ $# -gt 0 ]; do
 	shift
 done
 path=${url#http://pkgs.test/}
+# Test hook: a slow download, to hang up the terminal in the middle of one.
+if [ -f /run/fake-ts/slow-fetch ]; then
+	touch /run/fake-ts/fetching
+	sleep 2
+fi
 case $path in
 *\?mode=json*) path=${path%%\?*}index.json ;;
 esac
@@ -392,6 +397,25 @@ linked_to() { [ "$(readlink /usr/local/sbin/tailscaled)" = "/opt/tailscale/$1/ta
 eq() { [ "$1" = "$2" ]; }
 log_has() { grep -qF -- "$1" "$LOG"; }
 
+# check_active VERSION: VERSION is the running, linked and known-good version.
+check_active() {
+	check "daemon runs $1" eq "$(daemon_version)" "$1"
+	check "daemon is running" daemon_running
+	check "links point to $1" linked_to "$1"
+	check "known-good is $1" eq "$(good)" "$1"
+}
+
+# wait_until SECONDS COMMAND...: wait for COMMAND to succeed.
+wait_until() {
+	local tries=$(($1 * 10))
+	shift
+	until "$@" 2>/dev/null; do
+		tries=$((tries - 1))
+		[ "$tries" -gt 0 ] || return 1
+		sleep 0.1
+	done
+}
+
 update() { sh "$SCRIPT" "$@" >>"$FAKE/out" 2>&1; }
 
 # --- Tests -------------------------------------------------------------------
@@ -408,10 +432,7 @@ test_migration() {
 		"$(stat -c '%U:%G %a' /var/lib/tailscale)" "tailscale:tailscale 750"
 	check "state file keeps its owner and mode" eq \
 		"$(stat -c '%U:%G %a' /var/lib/tailscale/tailscaled.state)" "root:tailscale 600"
-	check "daemon runs 1.90.0" eq "$(daemon_version)" 1.90.0
-	check "daemon is running" daemon_running
-	check "links point to 1.90.0" linked_to 1.90.0
-	check "known-good is 1.90.0" eq "$(good)" 1.90.0
+	check_active 1.90.0
 	check "previous is the Alpine build" eq "$(previous)" 1.80.0-apk
 	check "the Alpine build is kept for rollback" test -x /opt/tailscale/1.80.0-apk/tailscaled
 	check "the kept Alpine CLI works" /opt/tailscale/1.80.0-apk/tailscale version
@@ -453,10 +474,7 @@ test_failed_update_rolls_back() {
 	release 1.92.0 stuck
 	update update --foreground
 	check "update exits 1" eq $? 1
-	check "daemon runs 1.90.0 again" eq "$(daemon_version)" 1.90.0
-	check "daemon is running" daemon_running
-	check "links point to 1.90.0" linked_to 1.90.0
-	check "known-good is still 1.90.0" eq "$(good)" 1.90.0
+	check_active 1.90.0
 	check "1.92.0 is skipped from now on" skipped 1.92.0
 	check "tailscaled stops on SIGTERM" test ! -e "$RUN/needed-sigkill"
 	check "no pending update left" test ! -e /var/lib/tailscale-update/pending
@@ -474,8 +492,7 @@ test_crash_rolls_back() {
 	release 1.93.0 crash
 	update update --foreground
 	check "update exits 1" eq $? 1
-	check "daemon runs 1.90.0 again" eq "$(daemon_version)" 1.90.0
-	check "daemon is running" daemon_running
+	check_active 1.90.0
 	check "1.93.0 is skipped from now on" skipped 1.93.0
 }
 
@@ -484,8 +501,7 @@ test_good_update() {
 	release 1.94.0 good
 	update update --foreground
 	check "update exits 0" eq $? 0
-	check "daemon runs 1.94.0" eq "$(daemon_version)" 1.94.0
-	check "known-good is 1.94.0" eq "$(good)" 1.94.0
+	check_active 1.94.0
 	check "previous is 1.90.0" eq "$(previous)" 1.90.0
 	check "state file untouched" eq "$(cat /var/lib/tailscale/tailscaled.state)" state-1.80.0
 }
@@ -496,7 +512,7 @@ test_prune() {
 	update update --foreground
 	release 1.96.0 good
 	update update --foreground
-	check "daemon runs 1.96.0" eq "$(daemon_version)" 1.96.0
+	check_active 1.96.0
 	check "at most 3 versions kept" test "$(find /opt/tailscale -mindepth 1 -maxdepth 1 -type d ! -name ".*" | wc -l)" -le 3
 	check "previous (1.95.0) kept" test -d /opt/tailscale/1.95.0
 	check "1.90.0 removed" test ! -e /opt/tailscale/1.90.0
@@ -506,8 +522,7 @@ test_manual_rollback() {
 	section "manual rollback"
 	update rollback --foreground
 	check "rollback exits 0" eq $? 0
-	check "daemon runs 1.95.0" eq "$(daemon_version)" 1.95.0
-	check "known-good is 1.95.0" eq "$(good)" 1.95.0
+	check_active 1.95.0
 	check "1.96.0 is skipped from now on" skipped 1.96.0
 	update update --foreground
 	check "update does not reinstall 1.96.0" eq "$(daemon_version)" 1.95.0
@@ -555,7 +570,7 @@ test_interrupted_update() {
 	ln -sfn /opt/tailscale/1.98.0/tailscale /usr/local/bin/tailscale
 	rc-service tailscale restart
 	update update --foreground
-	check "daemon runs 1.96.0 again" eq "$(daemon_version)" 1.96.0
+	check_active 1.96.0
 	check "1.98.0 is skipped" skipped 1.98.0
 	check "pending marker removed" test ! -e /var/lib/tailscale-update/pending
 }
@@ -568,61 +583,50 @@ test_detached() {
 	# update starts, like a dropped connection: every process in the login
 	# session gets SIGHUP.
 	setsid sh -c "sh $SCRIPT update >$FAKE/out 2>&1" &
-	local session=$! i=0
-	while [ $i -lt 300 ] && [ ! -d /var/lib/tailscale-update/lock ]; do
-		sleep 0.1
-		i=$((i + 1))
-	done
-	check "update started" test -d /var/lib/tailscale-update/lock
+	local session=$!
+	check "update started" wait_until 30 test -d /var/lib/tailscale-update/lock
 	kill -HUP -- "-$session" 2>/dev/null
 	sleep 0.5
 	kill -KILL -- "-$session" 2>/dev/null
-	i=0
-	while [ $i -lt 100 ] && [ -d /var/lib/tailscale-update/lock ]; do
-		sleep 0.2
-		i=$((i + 1))
-	done
-	check "worker finished" test ! -d /var/lib/tailscale-update/lock
-	check "daemon runs 1.99.0" eq "$(daemon_version)" 1.99.0
-	check "known-good is 1.99.0" eq "$(good)" 1.99.0
+	check "worker finished" wait_until 20 test ! -d /var/lib/tailscale-update/lock
+	check_active 1.99.0
 	check "log shows completion" log_has "Tailscale is now at 1.99.0"
 
 	section "detached update reports its exit status"
-	release 2.0.0 stuck
+	# A bad checksum fails before tailscaled is stopped, so this is quick.
+	release 2.0.0 good
+	echo 0000000000000000000000000000000000000000000000000000000000000000 \
+		>"$PKGS/stable/tailscale_2.0.0_$TSARCH.tgz.sha256"
 	sh "$SCRIPT" update >"$FAKE/out" 2>&1
-	check "exits 1 when rolled back" eq $? 1
-	check "terminal shows the log" grep -q "Rolled back to 1.99.0" "$FAKE/out"
-	check "daemon runs 1.99.0" eq "$(daemon_version)" 1.99.0
+	check "exits 1 on failure" eq $? 1
+	check "terminal shows the log" grep -q "SHA-256 mismatch" "$FAKE/out"
+	check_active 1.99.0
 
 	section "the update works when the script is piped to sh"
 	release 2.1.0 good
 	sh -s update <"$SCRIPT" >"$FAKE/out" 2>&1
 	check "exits 0" eq $? 0
-	check "daemon runs 2.1.0" eq "$(daemon_version)" 2.1.0
+	check_active 2.1.0
 	check "terminal shows the log" grep -q "Tailscale is now at 2.1.0" "$FAKE/out"
 
-	section "a piped update keeps its lock after losing its terminal"
+	section "a piped update survives losing its terminal"
 	release 2.2.0 stuck
+	touch "$RUN/slow-fetch"
 	setsid sh -c "sh -s update <$SCRIPT >$FAKE/out 2>&1" &
-	i=0
-	while [ $i -lt 50 ] && [ ! -s /var/lib/tailscale-update/lock/pid ]; do
-		sleep 0.1
-		i=$((i + 1))
-	done
-	# The worker is a subshell with the same command line; it ignores HUP.
-	pkill -HUP -f "sh -s update" 2>/dev/null
+	session=$!
+	check "update started" wait_until 30 test -e "$RUN/fetching"
+	# Piped, the worker is a subshell in the login session, so the hangup
+	# reaches it and every command it runs, here a download.
+	kill -HUP -- "-$session" 2>/dev/null
+	rm -f "$RUN/slow-fetch" "$RUN/fetching"
 	sleep 0.5
 	check "the lock names a live process" kill -0 "$(cat /var/lib/tailscale-update/lock/pid 2>/dev/null)"
 	sh "$SCRIPT" update --foreground >>"$FAKE/out" 2>&1
 	check "a second run is refused while the first is busy" eq $? 1
 	check "it reports the running update" log_has "another tailscale-update is running"
-	i=0
-	while [ $i -lt 100 ] && [ -d /var/lib/tailscale-update/lock ]; do
-		sleep 0.2
-		i=$((i + 1))
-	done
-	check "worker finished" test ! -d /var/lib/tailscale-update/lock
-	check "daemon runs 2.1.0 after the rollback" eq "$(daemon_version)" 2.1.0
+	check "worker finished" wait_until 20 test ! -d /var/lib/tailscale-update/lock
+	check "the update ran to the end" log_has "Rolled back to 2.1.0"
+	check_active 2.1.0
 }
 
 test_fresh_install() {
@@ -631,10 +635,9 @@ test_fresh_install() {
 	release 1.90.0 good
 	update update --foreground
 	check "update exits 0" eq $? 0
-	check "daemon runs 1.90.0" eq "$(daemon_version)" 1.90.0
+	check_active 1.90.0
 	check "service enabled at boot" test -L /etc/runlevels/default/tailscale
 	check "default conf.d written" test -f /etc/conf.d/tailscale
-	check "known-good is 1.90.0" eq "$(good)" 1.90.0
 	check "no previous version" test -z "$(previous)"
 	check "status works" sh "$SCRIPT" status
 }
@@ -672,7 +675,7 @@ test_state_owned_by_service_user() {
 	release 2.4.0 good
 	update update --foreground
 	check "update exits 0" eq $? 0
-	check "daemon runs 2.4.0" eq "$(daemon_version)" 2.4.0
+	check_active 2.4.0
 	check "reports that the state was not backed up" log_has "not backing up"
 	check "backup does not contain root's file" sh -c \
 		'! grep -qs secret /var/lib/tailscale-update/backup/tailscaled.state'
