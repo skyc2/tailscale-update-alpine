@@ -78,6 +78,7 @@ WANT=
 STAGING=
 LOCKED=0
 WORKER_PID=$$
+HUP_IGNORED=0
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -1136,7 +1137,7 @@ leave_service_cgroup() {
 run_worker() {
 	trap on_exit EXIT
 	trap 'exit 130' INT TERM
-	trap : HUP
+	[ "$HUP_IGNORED" = 1 ] || trap : HUP
 	if [ -n "${TSU_RESULT:-}" ]; then
 		echo "$WORKER_PID" >"$TSU_RESULT.pid"
 	fi
@@ -1172,7 +1173,11 @@ run_detached() {
 		TSU_WORKER=1 TSU_RESULT=$result setsid sh "$self" "$@" </dev/null >>"$LOG_FILE" 2>&1 &
 	else
 		(
-			trap : HUP
+			# Unlike the detached worker, this subshell stays in the
+			# terminal's process group, so a hangup reaches every command
+			# it runs. Ignore it for all of them, like nohup.
+			trap '' HUP
+			HUP_IGNORED=1
 			# $$ is still the parent's PID in a subshell.
 			read -r WORKER_PID _ </proc/self/stat || WORKER_PID=$$
 			TSU_RESULT=$result
