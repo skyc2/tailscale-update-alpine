@@ -244,7 +244,7 @@ trap 'exit 0' TERM
 [ -f $D/force-stuck ] && B=stuck
 [ -f $D/plant-link ] && rm $D/plant-link && ln -sfn /root/canary /var/lib/tailscale/tailscaled.state
 [ "$B" = crash ] && exit 1
-sleep 1
+sleep 0.2
 case $B in
 good) echo Running >$D/state ;;
 stuck) echo Starting >$D/state ;;
@@ -356,13 +356,13 @@ install_apk_tailscale() {
 	chmod 600 /var/lib/tailscale/tailscaled.state
 	rc-update add tailscale default
 	rc-service tailscale start
-	sleep 1.5
+	wait_until 10 grep -qx Running "$RUN/state"
 }
 
 write_config() {
 	cat >/etc/tailscale-update.conf <<EOF
 PKGS_URL=http://pkgs.test
-HEALTH_TIMEOUT=6
+HEALTH_TIMEOUT=2
 CRON_MAX_DELAY=0
 EOF
 	if [ "$HAVE_OPENSSL" = 1 ]; then
